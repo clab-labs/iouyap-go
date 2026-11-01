@@ -1,0 +1,27 @@
+# r1 has its management interface moved to Ethernet1/2, which frees
+# Ethernet0/0 for data. r2 keeps the default Ethernet0/0. r3 moves its
+# management interface without CLAB_IOL_MGMT_INTF and must stay unreachable.
+# The image ships without iouyap; the binary under test is bind-mounted.
+name: iouyap
+
+topology:
+  defaults:
+    kind: cisco_iol
+    image: ${IOL_IMAGE:=ghcr.io/clab-labs/cisco_iol:17.12.01-noiouyap}
+    binds:
+      - ${IOUYAP_BIN:=../iouyap}:/usr/bin/iouyap:ro
+  nodes:
+    r1:
+      startup-config: r1.partial.cfg
+      mgmt-intf: Ethernet1/2
+      env:
+        # containerlab does not export the mgmt interface to the container yet.
+        CLAB_IOL_MGMT_INTF: Ethernet1/2
+    r2:
+      startup-config: r2.partial.cfg
+    r3:
+      mgmt-intf: Ethernet1/2
+  links:
+    - endpoints: ["r1:Ethernet0/0", "r2:Ethernet0/3"]
+    - endpoints: ["r1:Ethernet0/1", "r2:Ethernet0/1"]
+    - endpoints: ["r1:Ethernet0/2", "r2:Ethernet0/2"]
