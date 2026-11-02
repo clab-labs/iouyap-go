@@ -1,5 +1,5 @@
-# Applied over iouyap.clab.yml: adds r1:Ethernet0/3 <-> r2:Ethernet1/0, which
-# needs a second slot on r2, and removes the Ethernet0/1 link.
+# Applied over iouyap.clab.yml: adds r1:Ethernet0/3 <-> r2:Ethernet1/0 and
+# removes the Ethernet0/1 link.
 #
 # r1 has its management interface moved to Ethernet1/2, which frees
 # Ethernet0/0 for data. r2 keeps the default Ethernet0/0. r3 moves its
@@ -22,6 +22,10 @@ topology:
         CLAB_IOL_MGMT_INTF: Ethernet1/2
     r2:
       startup-config: r2.partial.cfg
+      env:
+        # Slot 1 exists from first boot so Ethernet1/0, linked only in
+        # iouyap-apply.clab.yml, gets its startup configuration.
+        CLAB_IOL_NUM_SLOTS: "2"
     r3:
       mgmt-intf: Ethernet1/2
   links:

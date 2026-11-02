@@ -1,12 +1,14 @@
 *** Settings ***
 Documentation       Deploys IOL nodes with the iouyap build under test bind-mounted and
 ...                 checks management access, untagged and 802.1Q forwarding, a relocated
-...                 management interface, failure modes, and link changes via clab apply.
+...                 management interface, IOL supervision, failure modes, and link changes
+...                 via clab apply.
 Library             OperatingSystem
 Library             String
 
 Suite Setup         Deploy Lab
 Suite Teardown      Destroy Lab
+Test Teardown       Run Keyword If Test Failed    Log iouyap State
 
 
 *** Variables ***
@@ -14,13 +16,12 @@ ${CLAB_BIN}         sudo -E containerlab
 ${LAB_FILE}         ${CURDIR}/iouyap.clab.yml
 ${APPLY_FILE}       ${CURDIR}/iouyap-apply.clab.yml
 ${IOUYAP_BIN}       ${CURDIR}/../iouyap
+${BOOT_TIMEOUT}     5 min
 ${R1}               clab-iouyap-r1
 ${R2}               clab-iouyap-r2
 ${R3}               clab-iouyap-r3
 ${SSH}              sshpass -p admin ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 ...                 -o LogLevel=ERROR -o ConnectTimeout=10 -o PubkeyAuthentication=no
-# Matches the iouyap process, not the shell running the match.
-${FIND_IOUYAP}      for p in /proc/[0-9]*; do grep -qa '^/usr/bin/iouyap' $p/cmdline 2>/dev/null && echo $\{p#/proc/}; done
 
 
 *** Test Cases ***
@@ -39,10 +40,10 @@ Nodes run the iouyap build under test
     END
 
 Management reachable on default interface
-    Wait Until Keyword Succeeds    5 min    10s    Interface Has Mgmt IP    ${R2}    Ethernet0/0
+    Wait Until Keyword Succeeds    ${BOOT_TIMEOUT}    10s    Interface Has Mgmt IP    ${R2}    Ethernet0/0
 
 Management reachable on relocated interface
-    Wait Until Keyword Succeeds    5 min    10s    Interface Has Mgmt IP    ${R1}    Ethernet1/2
+    Wait Until Keyword Succeeds    ${BOOT_TIMEOUT}    10s    Interface Has Mgmt IP    ${R1}    Ethernet1/2
 
 Untagged forwarding
     Ping Succeeds    ${R1}    10.1.0.2
@@ -60,7 +61,7 @@ Mismatched VLAN IDs do not forward
 Relocated management is unreachable without CLAB_IOL_MGMT_INTF
     [Documentation]    iouyap maps eth0 to Ethernet0/0 while IOL expects management on
     ...    Ethernet1/2. Remove this test once containerlab exports CLAB_IOL_MGMT_INTF.
-    Wait Until Keyword Succeeds    5 min    10s    IOL Has Booted    ${R3}
+    Wait Until Keyword Succeeds    ${BOOT_TIMEOUT}    10s    IOL Has Booted    ${R3}
     ${ip} =    Mgmt IP    ${R3}
     Host Ping Fails    ${ip}
 
@@ -69,27 +70,56 @@ Second iouyap instance is refused
     Should Not Be Equal As Integers    ${rc}    0
     Should Contain    ${out}    already has a lock
 
-Management stops without iouyap and recovers on restart
+iouyap supervises IOL with every port in NETMAP
+    [Documentation]    iouyap runs as PID 1 and starts IOL as its only child, with -e set
+    ...    from CLAB_IOL_NUM_SLOTS (2 on r2) and NETMAP listing all 8 ports.
+    ${netmap} =    Run    docker exec ${R2} cat /iol/NETMAP
+    ${lines} =    Get Line Count    ${netmap}
+    Should Be Equal As Integers    ${lines}    8
+    Should Contain    ${netmap}    2:1/3 513:1/3
+    ${init} =    Run    docker exec ${R2} bash -c 'xargs -0 < /proc/1/cmdline'
+    Should Start With    ${init}    /usr/bin/iouyap
+    ${iol} =    Run    docker exec ${R2} bash -c 'c=$(cat /proc/1/task/*/children); xargs -0 < /proc/$\{c%% *}/cmdline'
+    Should Start With    ${iol}    /iol/iol.bin
+    Should End With    ${iol}    -e 2
+
+Console over telnet on the management address
+    [Documentation]    Ctrl-C on the console reaches IOS as a key and must not stop IOL.
+    ...    Enter goes first: after boot, IOS ignores console input until a lone Enter.
     ${ip} =    Mgmt IP    ${R2}
-    Wait Until Keyword Succeeds    1 min    5s    Host Ping Succeeds    ${ip}
-    Run    docker exec ${R2} bash -c 'kill $(${FIND_IOUYAP})'
-    ${pids} =    Run    docker exec ${R2} bash -c '${FIND_IOUYAP}'
-    Should Be Empty    ${pids}
-    Host Ping Fails    ${ip}
-    ${rc} =    Run And Return Rc    docker exec -d -w /iol ${R2} /usr/bin/iouyap 513 -q
+    Wait Until Keyword Succeeds    1 min    5s    Console Answers    ${ip}    \\r
+    Console Answers    ${ip}    \\003\\r
+
+Management address answers once
+    [Documentation]    eth0 shares IOL's address and MAC, and only IOL may answer pings.
+    ${ip} =    Mgmt IP    ${R2}
+    ${mac} =    Run    docker exec ${R2} cat /sys/class/net/eth0/address
+    Should Be Equal    ${mac}    aa:bb:cc:00:02:00
+    ${rc}    ${out} =    Run And Return Rc And Output    ping -c 5 -i 0.3 ${ip}
     Should Be Equal As Integers    ${rc}    0
-    Wait Until Keyword Succeeds    1 min    5s    Host Ping Succeeds    ${ip}
+    Should Not Contain    ${out}    DUP!
+
+Container stops when iouyap dies
+    [Documentation]    Killed from the host: PID 1 ignores SIGKILL sent from inside
+    ...    its own PID namespace.
+    ${pid} =    Run    docker inspect -f '{{.State.Pid}}' ${R3}
+    Run    sudo kill -9 ${pid}
+    Wait Until Keyword Succeeds    30s    1s    Container Is Stopped    ${R3}
 
 Apply adds and removes links
-    [Documentation]    IOL nodes are recreated by clab apply; r2 gains a second slot.
+    [Documentation]    IOL nodes are recreated by clab apply. The configuration is saved
+    ...    to NVRAM first: on recreate, containerlab rewrites the IOL boot config only
+    ...    after the container has started, so IOL may boot without it.
+    FOR    ${node}    IN    ${R1}    ${R2}
+        ${out} =    IOS    ${node}    write memory    hold=10
+        Should Contain    ${out}    [OK]
+    END
     ${rc}    ${out} =    Run And Return Rc And Output
-    ...    IOUYAP_BIN=${IOUYAP_BIN} ${CLAB_BIN} deploy -t ${APPLY_FILE}
+    ...    ${CLAB_BIN} deploy -t ${APPLY_FILE}
     Log    ${out}
     Should Be Equal As Integers    ${rc}    0
-    Wait Until Keyword Succeeds    5 min    10s    Interface Has Mgmt IP    ${R1}    Ethernet1/2
-    Wait Until Keyword Succeeds    5 min    10s    Interface Has Mgmt IP    ${R2}    Ethernet0/0
-    Configure    ${R1}    interface Ethernet0/3    ip address 10.3.0.1 255.255.255.0    no shutdown
-    Configure    ${R2}    interface Ethernet1/0    ip address 10.3.0.2 255.255.255.0    no shutdown
+    Wait Until Keyword Succeeds    ${BOOT_TIMEOUT}    10s    Interface Has Mgmt IP    ${R1}    Ethernet1/2
+    Wait Until Keyword Succeeds    ${BOOT_TIMEOUT}    10s    Interface Has Mgmt IP    ${R2}    Ethernet0/0
 
 Added link forwards after apply
     Ping Succeeds    ${R1}    10.3.0.2
@@ -105,8 +135,10 @@ Existing links forward after apply
 *** Keywords ***
 Deploy Lab
     File Should Exist    ${IOUYAP_BIN}
+    # Every clab call re-reads the topology, which binds ${IOUYAP_BIN}.
+    Set Environment Variable    IOUYAP_BIN    ${IOUYAP_BIN}
     ${rc}    ${out} =    Run And Return Rc And Output
-    ...    IOUYAP_BIN=${IOUYAP_BIN} ${CLAB_BIN} deploy -t ${LAB_FILE} --reconfigure
+    ...    ${CLAB_BIN} deploy -t ${LAB_FILE} --reconfigure
     Log    ${out}
     Should Be Equal As Integers    ${rc}    0
 
@@ -150,27 +182,47 @@ IOS
     Log    ${out}
     RETURN    ${out}
 
-Configure
-    [Documentation]    Enters each line in configuration mode over an interactive session.
-    [Arguments]    ${node}    @{lines}
-    ${cmds} =    Catenate    SEPARATOR=' '    conf t    @{lines}    end
-    ${rc}    ${out} =    Run And Return Rc And Output
-    ...    (printf '%s\\n' '${cmds}'; sleep 4; printf 'exit\\n') | ${SSH} -tt admin@${node}
-    Log    ${out}
-
 Interface Has Mgmt IP
     [Arguments]    ${node}    ${intf}
     ${out} =    IOS    ${node}    show ip interface brief
     Should Match Regexp    ${out}    ${intf}\\s+172\\.20\\.20\\.\\d+\\s+YES\\s+\\S+\\s+up\\s+up
 
 Ping Succeeds
-    [Documentation]    The first ping resolves ARP, so only the second must be loss-free.
+    [Documentation]    Warm-up pings repeat until one is answered, which also resolves
+    ...    ARP; then 20 pings must all be answered.
     [Arguments]    ${node}    ${target}
-    IOS    ${node}    ping ${target} repeat 5    hold=15
+    Wait Until Keyword Succeeds    1 min    1s    Ping Answers    ${node}    ${target}
     ${out} =    IOS    ${node}    ping ${target} repeat 20    hold=20
     Should Contain    ${out}    Success rate is 100 percent
 
+Ping Answers
+    [Arguments]    ${node}    ${target}
+    ${out} =    IOS    ${node}    ping ${target} repeat 5    hold=15
+    Should Match Regexp    ${out}    Success rate is [1-9]
+
 Ping Fails
     [Arguments]    ${node}    ${target}
-    ${out} =    IOS    ${node}    ping ${target} repeat 5 timeout 1    hold=15
+    ${out} =    IOS    ${node}    ping ${target} repeat 5 timeout 1    hold=25
     Should Contain    ${out}    Success rate is 0 percent
+
+Log iouyap State
+    [Documentation]    Logs per-port counters and the iouyap log of r1 and r2.
+    FOR    ${node}    IN    ${R1}    ${R2}
+        Run    docker kill -s USR1 ${node}
+        Sleep    1s
+        ${logs} =    Run    docker logs ${node} 2>&1 | grep 'level=' | tail -n 60
+        Log    ${node}:\n${logs}    WARN
+    END
+
+Container Is Stopped
+    [Arguments]    ${node}
+    ${running} =    Run    docker inspect -f '{{.State.Running}}' ${node}
+    Should Be Equal    ${running}    false
+
+Console Answers
+    [Documentation]    Sends ${keys} and then "show clock" over the telnet console at ${ip}.
+    [Arguments]    ${ip}    ${keys}
+    ${out} =    Run
+    ...    (sleep 2; printf "${keys}"; sleep 2; printf "show clock\\r"; sleep 3) | telnet ${ip} 5000
+    Log    ${out}
+    Should Match Regexp    ${out}    [>#]show clock\\s+\\*?\\d+:\\d+:\\d+

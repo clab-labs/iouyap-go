@@ -1,6 +1,10 @@
 // Command iouyap bridges a Cisco IOL instance to the container's ethN
 // interfaces. Interfaces are discovered through netlink and attached or
-// detached as they appear and disappear; no iouyap.ini or NETMAP is read.
+// detached as they appear and disappear; iouyap.ini is not read.
+//
+// Given an IOL command after "--", iouyap also supervises IOL: it waits for
+// the interfaces containerlab attaches, writes NETMAP, starts IOL, serves
+// its console over telnet on port 5000, and exits when IOL does.
 //
 // Interface ethN maps to IOL Ethernet slot/port with slot = N/4 and
 // port = N%4. When CLAB_IOL_MGMT_INTF names another port (for example
@@ -24,6 +28,8 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/spf13/pflag"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -51,8 +57,11 @@ type bridge struct {
 	uds     *net.UnixConn
 	dir     string
 	id      int          // IOU ID of this bridge (513 under containerlab)
-	iolID   atomic.Int32 // IOL instance ID, learned from received frames
+	iolID   atomic.Int32 // IOL instance ID; updated from received frames
 	mgmtIdx int
+	// mgmtMAC is eth0's MAC while the management address is shared with
+	// the console, else nil.
+	mgmtMAC atomic.Pointer[net.HardwareAddr]
 
 	mu     sync.Mutex
 	byName map[string]*ethPort
@@ -63,7 +72,7 @@ type bridge struct {
 type ethPort struct {
 	b       *bridge
 	dev     string
-	port    byte // IOU port byte: unit<<4 | bay
+	port    byte // IOU port byte: port<<4 | slot
 	fd      int
 	ifindex int
 	log     *slog.Logger
@@ -88,6 +97,9 @@ func (b *bridge) iouPort(idx int) byte {
 	slot, port := idx/4, idx%4
 	return byte(port<<4 | slot)
 }
+
+// portName formats an IOU port byte as IOL's slot/port.
+func portName(p byte) string { return fmt.Sprintf("%d/%d", p&0x0f, p>>4) }
 
 // openEth opens a promiscuous raw socket on dev that reports stripped VLAN tags.
 func openEth(dev string) (fd, ifindex int, err error) {
@@ -114,33 +126,46 @@ func openEth(dev string) (fd, ifindex int, err error) {
 	return fd, ifi.Index, nil
 }
 
+// ethDevs maps the name of every ethN interface to N.
+func ethDevs() (map[string]int, error) {
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	devs := map[string]int{}
+	for _, ifi := range ifs {
+		if m := ethRe.FindStringSubmatch(ifi.Name); m != nil {
+			devs[ifi.Name], _ = strconv.Atoi(m[1])
+		}
+	}
+	return devs, nil
+}
+
 // scan attaches every ethN interface that is not attached yet.
 func (b *bridge) scan() {
-	ifs, err := net.Interfaces()
+	devs, err := ethDevs()
 	if err != nil {
 		slog.Error("list interfaces failed", "err", err)
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, ifi := range ifs {
-		m := ethRe.FindStringSubmatch(ifi.Name)
-		if m == nil || b.byName[ifi.Name] != nil {
+	for dev, idx := range devs {
+		if b.byName[dev] != nil {
 			continue
 		}
-		idx, _ := strconv.Atoi(m[1])
 		if idx >= maxIdx {
-			slog.Warn("interface index too high, ignoring", "dev", ifi.Name)
+			slog.Warn("interface index too high, ignoring", "dev", dev)
 			continue
 		}
 		port := b.iouPort(idx)
-		log := slog.With("dev", ifi.Name, "port", fmt.Sprintf("%d/%d", port&0x0f, port>>4))
-		fd, ifindex, err := openEth(ifi.Name)
+		log := slog.With("dev", dev, "port", portName(port))
+		fd, ifindex, err := openEth(dev)
 		if err != nil {
 			log.Warn("attach failed", "err", err)
 			continue
 		}
-		p := &ethPort{b: b, dev: ifi.Name, port: port, fd: fd, ifindex: ifindex, log: log}
+		p := &ethPort{b: b, dev: dev, port: port, fd: fd, ifindex: ifindex, log: log}
 		b.byName[p.dev] = p
 		b.byPort[port].Store(p)
 		log.Info("interface attached", "ifindex", ifindex)
@@ -148,25 +173,22 @@ func (b *bridge) scan() {
 	}
 }
 
-// watch rescans interfaces on every netlink link event.
+// watch rescans interfaces on every link event.
 func (b *bridge) watch() {
-	b.scan()
-	nl, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
-	if err == nil {
-		err = unix.Bind(nl, &unix.SockaddrNetlink{Family: unix.AF_NETLINK, Groups: unix.RTMGRP_LINK})
-	}
-	if err != nil {
-		fatal("netlink subscribe failed", "err", err)
-	}
-	buf := make([]byte, 1<<16)
 	for {
-		// Message content is irrelevant: any link change triggers a rescan.
-		// ENOBUFS means events were lost, which a rescan also covers.
-		if _, err := unix.Read(nl, buf); err != nil && !errors.Is(err, unix.ENOBUFS) && !errors.Is(err, unix.EINTR) {
-			slog.Error("netlink read failed", "err", err)
-			os.Exit(1)
+		ch := make(chan netlink.LinkUpdate, 64)
+		if err := netlink.LinkSubscribe(ch, nil); err != nil {
+			fatal("netlink subscribe failed", "err", err)
 		}
+		// Scanning after subscribing leaves no gap where a new interface
+		// produces no event and is not yet listed.
 		b.scan()
+		for range ch {
+			b.scan()
+		}
+		// The channel closes when the subscription fails, for example when
+		// events overflow; resubscribing and rescanning recovers them.
+		slog.Warn("netlink subscription lost, resubscribing")
 	}
 }
 
@@ -191,11 +213,15 @@ func (p *ethPort) run() {
 	b.scan()
 }
 
-// recvEth reads one frame into buf, re-inserting the 802.1Q tag the kernel stripped.
+// recvEth reads one frame received by the device into buf, re-inserting the
+// 802.1Q tag the kernel stripped. Frames the device sends return n == 0.
 func recvEth(fd int, buf, oob []byte) (int, error) {
-	n, oobn, _, _, err := unix.Recvmsg(fd, buf[:len(buf)-vlanLen], oob, unix.MSG_TRUNC)
+	n, oobn, _, from, err := unix.Recvmsg(fd, buf[:len(buf)-vlanLen], oob, unix.MSG_TRUNC)
 	if err != nil || n <= 0 {
 		return n, err
+	}
+	if ll, ok := from.(*unix.SockaddrLinklayer); ok && ll.Pkttype == unix.PACKET_OUTGOING {
+		return 0, nil
 	}
 	if n > len(buf)-vlanLen {
 		n = len(buf) - vlanLen
@@ -241,6 +267,11 @@ func (p *ethPort) forward() error {
 			return errors.New("interface removed")
 		default:
 			return err
+		}
+		// Skips frames the device sent, and console traffic that belongs to
+		// the container's stack.
+		if n == 0 || p.dev == "eth0" && p.b.mgmtMAC.Load() != nil && isConsole(buf[hdrSize:hdrSize+n]) {
+			continue
 		}
 		p.rx.Add(1)
 		p.log.Log(ctx, levelTrace, "eth to iol", "bytes", n)
@@ -303,8 +334,7 @@ func (b *bridge) iolToEth() {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			slog.Error("IOU socket read failed", "err", err)
-			os.Exit(1)
+			fatal("IOU socket read failed", "err", err)
 		}
 		if n <= hdrSize {
 			continue
@@ -315,14 +345,17 @@ func (b *bridge) iolToEth() {
 		}
 		p := b.byPort[buf[4]].Load()
 		if p == nil {
-			slog.Log(ctx, levelTrace, "drop: no interface for port",
-				"port", fmt.Sprintf("%d/%d", buf[4]&0x0f, buf[4]>>4))
+			slog.Log(ctx, levelTrace, "drop: no interface for port", "port", portName(buf[4]))
 			continue
+		}
+		if p.dev == "eth0" && n >= hdrSize+12 {
+			b.followMgmtMAC(net.HardwareAddr(buf[hdrSize+6 : hdrSize+12]))
 		}
 		p.send(buf[hdrSize:n])
 	}
 }
 
+// stats logs the per-port counters.
 func (b *bridge) stats() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -350,24 +383,29 @@ func lock(name string) (*os.File, error) {
 }
 
 func usage() {
-	fmt.Printf(`Usage: %s [OPTION]... [ID]
+	fmt.Fprintf(os.Stderr, `Usage: %s [OPTION]... [ID] [-- IOL_COMMAND...]
 
 Bridge a Cisco IOL instance to the container's ethN interfaces.
-ID is our IOU ID (default 513).
+ID is the IOU ID of this bridge (default 513).
+
+With IOL_COMMAND, wait until CLAB_INTFS data interfaces exist, write
+./NETMAP with every port of every slot, then run IOL_COMMAND with
+"-e SLOTS" appended. The IOL console is served over telnet on port 5000,
+including on the management address. iouyap exits with IOL's exit code,
+and forwards SIGTERM to IOL.
 
 Options:
-  -h        print this message and exit
-  -q        only log warnings and errors
-  -v        debug logging; -vv also logs every packet
-  -p IOL_ID IOL instance ID (default $IOL_PID, else 1; also learned from traffic)
-  -V        print version and exit
-
+`, filepath.Base(os.Args[0]))
+	pflag.PrintDefaults()
+	fmt.Fprint(os.Stderr, `
 Environment:
   IOL_PID             IOL instance ID
   CLAB_IOL_MGMT_INTF  IOL port backed by eth0, e.g. Ethernet1/2 (default Ethernet0/0)
+  CLAB_INTFS          data interfaces to wait for before starting IOL (default 0)
+  CLAB_IOL_NUM_SLOTS  slots passed to IOL (default: enough for mgmt and every ethN)
 
 Send SIGUSR1 to log per-port counters.
-`, filepath.Base(os.Args[0]))
+`)
 }
 
 func fatal(msg string, args ...any) {
@@ -376,45 +414,33 @@ func fatal(msg string, args ...any) {
 }
 
 func main() {
-	level := slog.LevelInfo
-	iolArg := os.Getenv("IOL_PID")
-	// Parsed by hand because entrypoints pass flags after the ID
-	// ("iouyap 513 -q"), where package flag stops parsing.
-	var pos []string
-	args := os.Args[1:]
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if len(a) < 2 || a[0] != '-' {
-			pos = append(pos, a)
-			continue
+	iolDefault := 1
+	if v := os.Getenv("IOL_PID"); v != "" {
+		var err error
+		if iolDefault, err = strconv.Atoi(v); err != nil {
+			fatal("bad IOL_PID", "value", v)
 		}
-		for j := 1; j < len(a); j++ {
-			switch c := a[j]; c {
-			case 'h':
-				usage()
-				return
-			case 'V':
-				fmt.Println("iouyap version", version)
-				return
-			case 'q':
-				level = slog.LevelWarn
-			case 'v':
-				level -= 4
-			case 'p':
-				iolArg = a[j+1:]
-				if iolArg == "" {
-					if i++; i >= len(args) {
-						fmt.Fprintln(os.Stderr, "option -p needs an argument")
-						os.Exit(1)
-					}
-					iolArg = args[i]
-				}
-				j = len(a)
-			default:
-				fmt.Fprintf(os.Stderr, "unknown option -%c; use -h for help\n", c)
-				os.Exit(1)
-			}
+	}
+	quiet := pflag.BoolP("quiet", "q", false, "only log warnings and errors")
+	verbose := pflag.CountP("verbose", "v", "debug logging; -vv also logs every packet")
+	iolID := pflag.IntP("iol-id", "p", iolDefault, "IOL instance ID, also learned from traffic; $IOL_PID sets the default")
+	showVersion := pflag.BoolP("version", "V", false, "print version and exit")
+	pflag.Usage = usage
+	pflag.Parse()
+	if *showVersion {
+		fmt.Println("iouyap version", version)
+		return
+	}
+	pos, iolCmd := pflag.Args(), []string(nil)
+	if dash := pflag.CommandLine.ArgsLenAtDash(); dash >= 0 {
+		pos, iolCmd = pos[:dash], pos[dash:]
+		if len(iolCmd) == 0 {
+			fatal("no IOL command after --")
 		}
+	}
+	level := slog.LevelInfo - 4*slog.Level(*verbose)
+	if *quiet {
+		level = slog.LevelWarn
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: level,
@@ -436,13 +462,10 @@ func main() {
 			fatal("bad ID", "id", pos[0])
 		}
 	}
-	iolID := 1
-	if iolArg != "" {
-		if iolID, err = strconv.Atoi(iolArg); err != nil || iolID < 1 || iolID > 1024 {
-			fatal("bad IOL ID", "iol_id", iolArg)
-		}
+	if *iolID < 1 || *iolID > 1024 {
+		fatal("bad IOL ID", "iol_id", *iolID)
 	}
-	b.iolID.Store(int32(iolID))
+	b.iolID.Store(int32(*iolID))
 	if v := os.Getenv("CLAB_IOL_MGMT_INTF"); v != "" {
 		m := mgmtIntRe.FindStringSubmatch(v)
 		if m == nil {
@@ -455,8 +478,8 @@ func main() {
 		}
 		b.mgmtIdx = slot*4 + port
 	}
-	slog.Info("starting", "version", version, "id", b.id, "iol_id", iolID,
-		"mgmt_port", fmt.Sprintf("%d/%d", b.mgmtIdx/4, b.mgmtIdx%4))
+	slog.Info("starting", "version", version, "id", b.id, "iol_id", *iolID,
+		"mgmt_port", portName(b.iouPort(0)))
 
 	b.dir = fmt.Sprintf("/tmp/netio%d", os.Getuid())
 	os.Mkdir(b.dir, 0o700)
@@ -474,18 +497,24 @@ func main() {
 	go b.iolToEth()
 	go b.watch()
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1)
-	for s := range sig {
-		if s == syscall.SIGUSR1 {
-			b.stats()
-			continue
+	code := 0
+	if iolCmd != nil {
+		code = b.supervise(iolCmd)
+	} else {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1)
+		for s := range sig {
+			if s == syscall.SIGUSR1 {
+				b.stats()
+				continue
+			}
+			slog.Info("exiting", "signal", s.String())
+			break
 		}
-		slog.Info("exiting", "signal", s.String())
-		break
 	}
 	b.uds.Close()
 	os.Remove(sockName)
 	os.Remove(lf.Name())
 	lf.Close()
+	os.Exit(code)
 }

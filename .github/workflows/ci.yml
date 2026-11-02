@@ -51,10 +51,10 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install containerlab, Robot Framework and sshpass
+      - name: Install containerlab, Robot Framework, sshpass and telnet
         run: |
           bash -c "$(curl -sL https://get.containerlab.dev)"
-          sudo apt-get update && sudo apt-get install -y sshpass
+          sudo apt-get update && sudo apt-get install -y sshpass telnet
           pip install robotframework
       - run: docker pull ghcr.io/clab-labs/cisco_iol:17.12.01-noiouyap
       - run: robot --outputdir robot-out tests/iouyap.robot

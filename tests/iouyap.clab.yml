@@ -19,6 +19,10 @@ topology:
         CLAB_IOL_MGMT_INTF: Ethernet1/2
     r2:
       startup-config: r2.partial.cfg
+      env:
+        # Slot 1 exists from first boot so Ethernet1/0, linked only in
+        # iouyap-apply.clab.yml, gets its startup configuration.
+        CLAB_IOL_NUM_SLOTS: "2"
     r3:
       mgmt-intf: Ethernet1/2
   links:
