@@ -58,12 +58,12 @@ Mismatched VLAN IDs do not forward
     [Documentation]    r1 tags with VLAN 200 and r2 with VLAN 300 on the same link.
     Ping Fails    ${R1}    10.4.0.2
 
-Relocated management is unreachable without CLAB_IOL_MGMT_INTF
-    [Documentation]    iouyap maps eth0 to Ethernet0/0 while IOL expects management on
-    ...    Ethernet1/2. Remove this test once containerlab exports CLAB_IOL_MGMT_INTF.
-    Wait Until Keyword Succeeds    ${BOOT_TIMEOUT}    10s    IOL Has Booted    ${R3}
-    ${ip} =    Mgmt IP    ${R3}
-    Host Ping Fails    ${ip}
+containerlab exports the management interface
+    [Documentation]    iouyap learns the relocated management port from CLAB_IOL_MGMT_INTF,
+    ...    which containerlab sets from mgmt-intf.
+    ${env} =    Run    docker exec ${R3} printenv CLAB_IOL_MGMT_INTF
+    Should Be Equal    ${env}    Ethernet1/2
+    Wait Until Keyword Succeeds    ${BOOT_TIMEOUT}    10s    Interface Has Mgmt IP    ${R3}    Ethernet1/2
 
 Second iouyap instance is refused
     ${rc}    ${out} =    Run And Return Rc And Output    docker exec ${R2} /usr/bin/iouyap 513
@@ -158,20 +158,8 @@ Mgmt IP
     Should Match Regexp    ${ip}    ^\\d+\\.\\d+\\.\\d+\\.\\d+$
     RETURN    ${ip}
 
-IOL Has Booted
-    [Arguments]    ${node}
-    ${logs} =    Run    docker logs ${node} 2>&1
-    Should Contain    ${logs}    %SYS-5-RESTART
 
-Host Ping Succeeds
-    [Arguments]    ${ip}
-    ${rc} =    Run And Return Rc    ping -c 3 -W 1 ${ip}
-    Should Be Equal As Integers    ${rc}    0
 
-Host Ping Fails
-    [Arguments]    ${ip}
-    ${rc} =    Run And Return Rc    ping -c 5 -W 1 ${ip}
-    Should Not Be Equal As Integers    ${rc}    0    ${ip} answered pings
 
 IOS
     [Documentation]    Runs one exec command over SSH. Stdin stays open for ${hold}

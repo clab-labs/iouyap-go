@@ -51,9 +51,23 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install containerlab, Robot Framework, sshpass and telnet
+      - uses: actions/checkout@v4
+        with:
+          repository: srl-labs/containerlab
+          ref: main
+          path: containerlab
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: containerlab/go.mod
+          cache-dependency-path: containerlab/go.sum
+      - name: Build containerlab from main
+        working-directory: containerlab
         run: |
-          bash -c "$(curl -sL https://get.containerlab.dev)"
+          CGO_ENABLED=0 go build -trimpath -o containerlab .
+          sudo install -m 0755 containerlab /usr/local/bin/containerlab
+          containerlab version
+      - name: Install Robot Framework, sshpass and telnet
+        run: |
           sudo apt-get update && sudo apt-get install -y sshpass telnet
           pip install robotframework
       - run: docker pull ghcr.io/clab-labs/cisco_iol:17.12.01-noiouyap
